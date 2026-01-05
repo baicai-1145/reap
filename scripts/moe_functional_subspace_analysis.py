@@ -49,6 +49,14 @@ try:
 except Exception:
     print("ℹ️ Info: Could not import 'Qwen3MoeSparseMoeBlock'")
 
+# Qwen3 Next MoE
+try:
+    from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextSparseMoeBlock
+    MOE_CLASSES['Qwen3NextSparseMoeBlock'] = Qwen3NextSparseMoeBlock
+    print("✅ Successfully imported 'Qwen3NextSparseMoeBlock'")
+except Exception:
+    print("ℹ️ Info: Could not import 'Qwen3NextSparseMoeBlock'")
+
 # Mixtral MoE
 try:
     from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock

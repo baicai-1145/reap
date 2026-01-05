@@ -16,6 +16,17 @@ MODEL_ATTRS = {
         "num_experts": "num_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+    "Qwen3NextForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
     "Qwen3-Coder-30B-A3B-Instruct": {
         "moe_block": "mlp",
         "gate_proj": "gate_proj",

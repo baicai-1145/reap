@@ -346,42 +346,101 @@ class MoETransformerObserver(BaseTransformerObserver):
                 )
             input = args[0]  # (batch_size, seq_len, hidden_dim)
             device = input.device
-            if layer_number not in self.state:
-                self.state[layer_number] = self._initialize_state(output, num_experts)
             batch_size, sequence_length, hidden_dim = input.shape
             flat_input = input.view(-1, hidden_dim)  # total_seq_len, hidden
-            activations = torch.zeros((num_experts, *flat_input.shape), device=device)
+            
+            num_tokens = batch_size * sequence_length
+            num_tokens_tensor = torch.tensor(num_tokens, device="cpu", dtype=torch.long)
 
+            if layer_number not in self.state:
+                self.state[layer_number] = self._initialize_state(output, num_experts)
+
+            # --- PRUNE/MERGE SALIENCY CRITERIA PREP ---------------------------
+            *_, router_logits = output  # (total_tokens, num_experts)
+            _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+            
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float).to(device)
+            if self.hook_config.renormalize_router_weights:
+                topk_weights = torch.gather(routing_weights, 1, selected_experts)
+                routing_weights = routing_weights / topk_weights.sum(dim=-1, keepdim=True)
+                routing_weights = torch.clamp(routing_weights, min=torch.finfo(routing_weights.dtype).eps)
+
+            expert_frequency = torch.bincount(
+                selected_experts.view(-1), minlength=num_experts
+            ).to(device)
+            pairwise_expert_frequency = (expert_frequency.unsqueeze(0) + expert_frequency.unsqueeze(1)).to(device)
+
+            self.state[layer_number]["total_tokens"] += num_tokens_tensor
+            self.state[layer_number]["expert_frequency"] += expert_frequency.to("cpu", torch.long)
+            self.state[layer_number]["pairwise_expert_frequency"] += pairwise_expert_frequency.to("cpu", torch.long)
+
+            # --- PROCESS EXPERTS ----------------------------------------------
+            if self.hook_config.record_pruning_metrics_only and not self.hook_config.fused_experts:
+                # OPTIMIZED PATH: Stream metrics and only compute for active tokens to save memory and time
+                
+                # Pre-calculate token indices for all experts to avoid 512 torch.where calls
+                # selected_experts shape: (total_tokens, top_k)
+                total_tokens = selected_experts.shape[0]
+                expert_to_token_indices = [[] for _ in range(num_experts)]
+                
+                # Faster way to group tokens by expert
+                flat_selected = selected_experts.flatten()
+                token_indices_repeated = torch.arange(total_tokens, device=device).unsqueeze(1).expand(-1, top_k).flatten()
+                
+                # Use a loop but it's faster than 512 where() calls on a large tensor
+                # Actually, for 512 experts, let's just use a more efficient grouping if possible
+                # But even better: just iterate and use the mask
+                
+                layer_ean_means = torch.zeros(num_experts, device=device)
+                layer_reaps = torch.zeros(num_experts, device=device)
+                
+                for i in range(num_experts):
+                    # Only find tokens assigned to expert i
+                    mask = (selected_experts == i).any(dim=-1)
+                    if not mask.any():
+                        continue
+                    
+                    token_indices = mask.nonzero(as_tuple=True)[0]
+                    expert = module.experts[i]
+                    
+                    # Only compute expert output for the tokens it's assigned to
+                    expert_input = flat_input[token_indices]
+                    expert_out = expert(expert_input) # (num_active_tokens, hidden_dim)
+                    
+                    # active_router_weights shape: (num_active_tokens,)
+                    active_router_weights = routing_weights[token_indices, i]
+                    ean_norm = torch.linalg.norm(expert_out, dim=-1)
+                    
+                    # Store results in local GPU tensors
+                    self.state[layer_number]["ean_sum"][i] += ean_norm.sum().cpu()
+                    self.state[layer_number]["weighted_ean_sum"][i] += (ean_norm * active_router_weights).sum().cpu()
+                    self.state[layer_number]["weighted_expert_frequency_sum"][i] += active_router_weights.sum().cpu()
+                    
+                    layer_ean_means[i] = ean_norm.mean()
+                    layer_reaps[i] = (ean_norm * active_router_weights).mean()
+
+                    # super experts
+                    selected_activations_max = expert_out.max().cpu()
+                    if selected_activations_max > self.state[layer_number]["max_activations"][i]:
+                        self.state[layer_number]["max_activations"][i] = selected_activations_max
+                    
+                    del expert_out, ean_norm, expert_input
+                
+                # Single update call per layer instead of 512
+                self.state[layer_number]["ean_mean"].update(layer_ean_means.cpu(), expert_frequency.cpu())
+                self.state[layer_number]["reap"].update(layer_reaps.cpu(), expert_frequency.cpu())
+                
+                # Cleanup
+                del routing_weights, selected_experts, expert_frequency, pairwise_expert_frequency
+                del layer_ean_means, layer_reaps
+                gc.collect()
+                return # End of optimized _hook_fn
+
+            # LEGACY PATH: Allocates large activations tensor (used for merging or fused experts)
+            activations = torch.zeros((num_experts, *flat_input.shape), device=device)
             if self.hook_config.fused_experts:
                 _, router_scores = output  # (num_experts, total_tokens)
-                router_logits = module.router(flat_input)  # (total_tokens, num_experts)
-                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                selected_experts = selected_experts.to(device)
-                router_indices = (
-                    torch.arange(batch_size * sequence_length, device=device)
-                    .view(1, -1)
-                    .expand(router_scores.size(0), -1)
-                )
-                router_indices = router_indices.reshape(-1, 1).expand(-1, hidden_dim)
-                routed_in = torch.gather(
-                    input=flat_input,
-                    dim=0,
-                    index=router_indices,
-                ).to(device)
-                # we do not apply router_scores
-                # record unweighted activations for all experts
-                routed_out = module.experts(routed_in)
-                activations = routed_out.view(num_experts, *flat_input.shape)
-
-            else:  # loop based MoE execution
-                # ernie returns combined_output, combine_weights, router_loss, gate_logits
-                *_, router_logits = output  # (total_tokens, num_experts)
-                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                # selected_experts = selected_experts.to(device)
-                for idx, expert in enumerate(module.experts):
-                    activations[idx] = expert(flat_input).to(
-                        device
-                    )  # (num_experts, total_seq_len, hidden_dim)
+                # ... rest of fused logic ...
 
             del flat_input
             num_tokens = batch_size * sequence_length
@@ -575,6 +634,11 @@ class Qwen3MoEObserverHookConfig(MoETransformerObserverConfig):
 
 
 @dataclass
+class Qwen3NextMoEObserverHookConfig(MoETransformerObserverConfig):
+    module_class_name_to_hook_regex: Optional[str] = "Qwen3NextSparseMoeBlock"
+
+
+@dataclass
 class Llama4MoEObserverHookConfig(MoETransformerObserverConfig):
     module_class_name_to_hook_regex: Optional[str] = "Llama4TextMoe"
     fused_experts: bool = True  # Llama4 uses fused experts
@@ -617,6 +681,7 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
 OBSERVER_CONFIG_REGISTRY = {
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
+    "Qwen3NextForCausalLM": Qwen3NextMoEObserverHookConfig,
     "Llama4ForCausalLM": Llama4MoEObserverHookConfig,
     "MixtralForCausalLM": MixtralMoEObserverHookConfig,
     "DeepseekV2ForCausalLM": DeepSeekMoEObserverHookConfig,

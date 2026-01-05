@@ -206,35 +206,190 @@ def record_activations(
             cat_dir.mkdir(parents=True, exist_ok=True)
             f_name = cat_dir / obs_args.output_file_name
             if f_name.exists() and not obs_args.overwrite_observations:
-                logger.info(
-                    f"Category '{category}' previously processed. Skipping to next category..."
-                )
+                logger.info(f"Category '{category}' previously processed. Skipping...")
                 continue
-            try:
-                logger.info("No previous data found @ %s", f_name)
-                for sample in tqdm(cat_data, desc=f"Processing {category} samples"):
-                    model(sample.to(model.device))
-            except Exception as e:
-                logger.error(f"Error processing category '{category}'")
-                logger.info(
-                    f"Saving partial results for category '{category}' and exiting"
-                )
-                observer.save_state(cat_dir / "partial.pkl")
-                logger.info(
-                    f"{category} data processed and saved to "
-                    f"{cat_dir / obs_args.output_file_name}"
-                )
-                raise e
-            observer.save_state(cat_dir / obs_args.output_file_name)
-            observer.reset()
-            logger.info(
-                f"{category} data processed and saved to "
-                f"{cat_dir / obs_args.output_file_name}"
-            )
-    observer.close_hooks()
-    with open(f"{cat_dir / obs_args.output_file_name}", "rb") as f:
-        observer_data = torch.load(f, weights_only=False)
-    return observer_data
+
+            logger.info("No previous data found. Starting LEO (Layer-wise Expert-wise Observation) optimized path...")
+            
+            # 1. Initial Hidden States (Embeddings)
+            all_samples = torch.cat(cat_data, dim=0) # (TotalSamples, SeqLen)
+            num_total_samples = all_samples.shape[0]
+            batch_size = 4 # Reduced to 4 to save base VRAM and prevent OOM
+            seq_len = all_samples.shape[1]
+            
+            # Prepare Attention Mask (typically all ones for calibration if no padding)
+            # and position embeddings
+            # Base causal mask (2D: SeqLen x SeqLen)
+            causal_mask = torch.full((seq_len, seq_len), fill_value=float("-inf"), device=model.device, dtype=model.dtype)
+            causal_mask = torch.triu(causal_mask, diagonal=1)
+
+            h_states = []
+            logger.info("Computing initial embeddings...")
+            for i in range(0, num_total_samples, batch_size):
+                batch = all_samples[i:i+batch_size].to(model.device)
+                h = model.model.embed_tokens(batch)
+                h_states.append(h.cpu())
+                del batch
+            h_states = torch.cat(h_states, dim=0) # (TotalSamples, SeqLen, Hidden) -> in RAM
+            
+            # 2. Iterate through layers
+            num_layers = len(model.model.layers)
+            for l_idx, layer in enumerate(tqdm(model.model.layers, desc="Processing Layers")):
+                # a. Pre-MoE: Attention and Norms
+                next_h_states = []
+                moe_inputs = []
+                
+                # Non-MoE part (Attention + Norm) is fast, run in batches
+                for i in range(0, num_total_samples, batch_size):
+                    batch_h = h_states[i:i+batch_size].to(model.device)
+                    current_batch_size = batch_h.shape[0]
+                    
+                    # Prepare RoPE and Mask for this batch
+                    position_ids = torch.arange(seq_len, device=model.device).expand(current_batch_size, -1)
+                    pos_emb = model.model.rotary_emb(batch_h, position_ids)
+                    
+                    # Correctly expand mask for current batch size: (Batch, 1, Seq, Seq)
+                    current_mask = causal_mask.view(1, 1, seq_len, seq_len).expand(current_batch_size, 1, -1, -1)
+
+                    residual = batch_h
+                    hidden_states = layer.input_layernorm(batch_h)
+                    
+                    if hasattr(layer, "linear_attn"):
+                        # Linear attention (GatedDeltaNet) doesn't take position_embeddings
+                        # It might take attention_mask, but let's be safe and check or use positional args if needed
+                        # Based on the error, it definitely doesn't like 'position_embeddings'
+                        hidden_states = layer.linear_attn(
+                            hidden_states, 
+                            attention_mask=current_mask
+                        )[0]
+                    else:
+                        # Full attention (Qwen3NextAttention) needs both
+                        hidden_states = layer.self_attn(
+                            hidden_states,
+                            attention_mask=current_mask,
+                            position_embeddings=pos_emb
+                        )[0]
+                    
+                    hidden_states = residual + hidden_states
+                    
+                    residual = hidden_states
+                    moe_input = layer.post_attention_layernorm(hidden_states)
+                    
+                    moe_inputs.append(moe_input.cpu())
+                    next_h_states.append(residual.cpu())
+                    del batch_h, hidden_states, moe_input, pos_emb, position_ids
+                
+                moe_inputs = torch.cat(moe_inputs, dim=0) # (TotalSamples, SeqLen, Hidden) -> in RAM
+                next_h_states = torch.cat(next_h_states, dim=0) # (TotalSamples, SeqLen, Hidden) -> in RAM
+                
+                # b. MoE Stage (The bottleneck)
+                # This is where we do Expert-wise for ALL samples at once
+                moe_block = layer.mlp
+                total_tokens = moe_inputs.shape[0] * moe_inputs.shape[1]
+                flat_moe_inputs = moe_inputs.view(total_tokens, -1)
+                
+                # i. Router (Run in one or two batches)
+                router_logits = []
+                router_batch_size = 4096 # Large batch for linear layer
+                for i in range(0, total_tokens, router_batch_size):
+                    batch_in = flat_moe_inputs[i:i+router_batch_size].to(model.device)
+                    logits = moe_block.gate(batch_in)
+                    router_logits.append(logits.cpu())
+                    del batch_in, logits
+                router_logits = torch.cat(router_logits, dim=0) # (TotalTokens, NumExperts)
+                
+                # Trigger Observer metrics manually (since we are bypassing the hook)
+                # But to stay KISS, let's just use the logic from observer.py
+                top_k = model.config.num_experts_per_tok
+                num_experts = model.config.num_experts
+                
+                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+                routing_weights = torch.nn.functional.softmax(router_logits, dim=-1)
+                
+                # Collect MoE Output
+                moe_outputs = torch.zeros_like(flat_moe_inputs) # (TotalTokens, Hidden)
+                
+                # Add Shared Expert contribution first
+                if hasattr(moe_block, "shared_expert"):
+                    logger.debug(f"Layer {l_idx}: Computing shared expert...")
+                    for i in range(0, total_tokens, batch_size * 128):
+                        batch_in = flat_moe_inputs[i:i+batch_size*128].to(model.device)
+                        shared_out = moe_block.shared_expert(batch_in)
+                        shared_gate = torch.sigmoid(moe_block.shared_expert_gate(batch_in))
+                        moe_outputs[i:i+batch_size*128] = (shared_out * shared_gate).cpu()
+                        del batch_in, shared_out, shared_gate
+                    torch.cuda.empty_cache()
+
+                # ii. EXPERT-WISE LOOP (The PCIe Savior)
+                for exp_idx in tqdm(range(num_experts), desc=f"Layer {l_idx} Experts", leave=False):
+                    token_indices, _ = torch.where(selected_experts == exp_idx)
+                    if token_indices.numel() == 0:
+                        continue
+                    
+                    # LOAD EXPERT ONCE, RUN ALL TOKENS
+                    expert = moe_block.experts[exp_idx]
+                    # FORCE WEIGHTS TO GPU MANUALLY
+                    expert.to(model.device)
+                    
+                    expert_input = flat_moe_inputs[token_indices].to(model.device)
+                    expert_out = expert(expert_input) # (NumActive, Hidden)
+                    
+                    # Accumulate metrics (similar to observer logic)
+                    exp_weights = routing_weights[token_indices, exp_idx].to(model.device)
+                    ean_norm = torch.linalg.norm(expert_out, dim=-1)
+                    
+                    # Update observer state (manually since we bypass hooks)
+                    if l_idx not in observer.state:
+                        observer.state[l_idx] = observer._initialize_state((moe_inputs[0:1],), num_experts)
+                    
+                    obs_state = observer.state[l_idx]
+                    obs_state["ean_sum"][exp_idx] += ean_norm.sum().cpu()
+                    obs_state["weighted_ean_sum"][exp_idx] += (ean_norm * exp_weights).sum().cpu()
+                    obs_state["expert_frequency"][exp_idx] += token_indices.numel()
+                    
+                    # Update trackers
+                    single_ean_mean = torch.zeros(num_experts, device="cpu")
+                    single_ean_mean[exp_idx] = ean_norm.mean().cpu()
+                    single_freq = torch.zeros(num_experts, dtype=torch.long, device="cpu")
+                    single_freq[exp_idx] = token_indices.numel()
+                    obs_state["ean_mean"].update(single_ean_mean, single_freq)
+                    
+                    single_reap = torch.zeros(num_experts, device="cpu")
+                    single_reap[exp_idx] = (ean_norm * exp_weights).mean().cpu()
+                    obs_state["reap"].update(single_reap, single_freq)
+                    
+                    obs_state["weighted_expert_frequency_sum"][exp_idx] += exp_weights.sum().cpu()
+                    
+                    # Max activations
+                    m_act = expert_out.max().cpu()
+                    if m_act > obs_state["max_activations"][exp_idx]:
+                        obs_state["max_activations"][exp_idx] = m_act
+                    
+                    # Add to moe_outputs for next layer
+                    # Note: Qwen3Next uses weighted sum
+                    moe_outputs[token_indices] += (expert_out * exp_weights.unsqueeze(-1)).cpu()
+                    
+                    # FORCE WEIGHTS BACK TO CPU IMMEDIATELY
+                    expert.to("cpu")
+                    
+                    del expert_input, expert_out, exp_weights, ean_norm
+                    
+                    # Periodic cache clearing every 32 experts (more aggressive for 32GB)
+                    if exp_idx % 32 == 0:
+                        torch.cuda.empty_cache()
+                
+                # Finalize layer output: next_h_states = residual + moe_output
+                h_states = (next_h_states.view(total_tokens, -1) + moe_outputs).view(num_total_samples, -1, model.config.hidden_size)
+                obs_state["total_tokens"] += total_tokens
+                
+                del moe_inputs, next_h_states, moe_outputs, router_logits, selected_experts, routing_weights
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            observer.save_state(f_name)
+            logger.info(f"Category '{category}' finished via LEO path.")
+
+    return observer.report_state()
 
 
 def cluster(
