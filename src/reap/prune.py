@@ -289,6 +289,14 @@ def main():
 
     # pruning
     logger.info("Start of pruning")
+    if not observer_data:
+        raise RuntimeError(
+            "Observer data is empty. If you are using precomputed observations, "
+            "ensure `--overwrite_observations false` and that the observations file "
+            "exists under the corresponding `artifacts/.../all/` directory."
+        )
+
+    total_experts = len(observer_data[next(iter(observer_data))]["expert_frequency"])
     n_experts_to_prune = prune_args.n_experts_to_prune
     if n_experts_to_prune is None:
         if cluster_args.compression_ratio is None:
@@ -297,9 +305,6 @@ def main():
             )
         else:
             # Calculate n_experts_to_prune from compression_ratio
-            total_experts = len(
-                observer_data[next(iter(observer_data))]["expert_frequency"]
-            )
             n_experts_to_prune = int(total_experts * cluster_args.compression_ratio)
             logger.info(
                 f"Calculated n_experts to prune: {n_experts_to_prune} from compression_ratio: {cluster_args.compression_ratio}"

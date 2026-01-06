@@ -102,6 +102,16 @@ def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path
 def record_activations(
     model, tokenizer, reap_args, model_args, ds_args, obs_args, results_dir
 ):
+    # Fast path: if not splitting by category, we only use the "all" bucket.
+    # If the observations file already exists and overwrite is disabled, load it
+    # directly to avoid re-loading the dataset and re-running the model.
+    if not obs_args.split_by_category:
+        cat_dir = results_dir / "all"
+        f_name = cat_dir / obs_args.output_file_name
+        if f_name.exists() and not obs_args.overwrite_observations:
+            logger.info("Found existing observations at %s. Loading...", f_name)
+            return torch.load(f_name, weights_only=False)
+
     if ds_args.dataset_name == "combined":
         # just return the combined data
         cat_dir = results_dir / "all"
@@ -200,6 +210,7 @@ def record_activations(
 
     # run samples over model and save observer state
     with torch.no_grad():
+        last_saved_path: pathlib.Path | None = None
         for category, cat_data in category_data_batches.items():
             logger.info(f"Processing category: {category}...")
             cat_dir = results_dir / str_to_directory_name(category)
@@ -207,6 +218,7 @@ def record_activations(
             f_name = cat_dir / obs_args.output_file_name
             if f_name.exists() and not obs_args.overwrite_observations:
                 logger.info(f"Category '{category}' previously processed. Skipping...")
+                last_saved_path = f_name
                 continue
 
             logger.info("No previous data found. Starting LEO (Layer-wise Expert-wise Observation) optimized path...")
@@ -416,8 +428,12 @@ def record_activations(
             observer.save_state(f_name)
             logger.info(f"Category '{category}' finished via LEO path.")
             observer.reset()
+            last_saved_path = f_name
 
-    return observer.report_state()
+    observer.close_hooks()
+    if last_saved_path is None:
+        raise RuntimeError("No observations were produced or found on disk.")
+    return torch.load(last_saved_path, weights_only=False)
 
 
 def cluster(
