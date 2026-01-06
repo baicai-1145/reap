@@ -415,6 +415,7 @@ def main():
         )
 
     total_experts = len(observer_data[next(iter(observer_data))]["expert_frequency"])
+    n_experts_to_prune = prune_args.n_experts_to_prune
 
     keep_plan = None
     if prune_args.keep_plan_path is not None:
@@ -444,8 +445,6 @@ def main():
             keep_total,
             total_capacity,
         )
-
-    n_experts_to_prune = prune_args.n_experts_to_prune
     if keep_plan is None:
         if n_experts_to_prune is None:
             if cluster_args.compression_ratio is None:
