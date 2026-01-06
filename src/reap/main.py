@@ -17,7 +17,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
-from datasets import load_dataset
+from datasets import load_dataset, Features, Value
 from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 
 from accelerate.utils import set_seed
@@ -125,6 +125,23 @@ def record_activations(
     try:
         ds_path = pathlib.Path(ds_args.dataset_name)
         if ds_path.exists():
+            local_features: Features | None = None
+            if ds_args.dataset_name == "artifacts/openthoughts_114k_samples_by_domain":
+                # HuggingFace Datasets may infer null columns when a field is always null
+                # in the first jsonl file(s). Later files with string values then fail to
+                # cast (string -> null). Pin a stable schema for our local jsonl bundle.
+                local_features = Features(
+                    {
+                        "problem": Value("string"),
+                        "deepseek_reasoning": Value("string"),
+                        "deepseek_solution": Value("string"),
+                        "ground_truth_solution": Value("string"),
+                        "domain": Value("string"),
+                        "source": Value("string"),
+                        "test_cases": Value("string"),
+                        "starter_code": Value("string"),
+                    }
+                )
             if ds_path.is_dir():
                 jsonl_files = sorted(
                     [str(p) for p in ds_path.glob("*.jsonl")]
@@ -142,6 +159,7 @@ def record_activations(
                     data_files=jsonl_files,
                     split="train",
                     streaming=False,
+                    features=local_features,
                 )
             else:
                 raw_ds = load_dataset(
@@ -149,6 +167,7 @@ def record_activations(
                     data_files={"train": str(ds_path)},
                     split="train",
                     streaming=False,
+                    features=local_features,
                 )
         elif ds_args.dataset_name == "allenai/c4":
             file_url = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
