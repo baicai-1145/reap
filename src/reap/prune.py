@@ -326,7 +326,7 @@ def prune_with_keep_plan(
 
 def get_pruned_model_dir(
     results_dir,
-    n_experts_to_prune: str,
+    n_experts_to_prune: int,
     total_experts: int,
     prune_args,
     seed: int,
@@ -338,6 +338,8 @@ def get_pruned_model_dir(
         pruned_model_name += "-perserve_super"
     elif prune_args.perserve_outliers:
         pruned_model_name += "-perserve_outlier"
+    if getattr(prune_args, "keep_plan_path", None):
+        pruned_model_name += "-keepplan"
     if renorm:
         pruned_model_name += f"-renorm_{str(renorm).lower()}"
     pruned_model_name += f"-seed_{seed}"
@@ -425,6 +427,23 @@ def main():
                 metric_in_plan,
                 prune_args.prune_method,
             )
+        # Derive an effective compression ratio for naming and logging.
+        keep_counts = keep_plan.get("keep_counts", [])
+        layers_in_plan = keep_plan.get("layers", [])
+        if not keep_counts or not layers_in_plan:
+            raise ValueError("Keep plan must include non-empty 'layers' and 'keep_counts'.")
+        keep_total = int(sum(int(x) for x in keep_counts))
+        total_capacity = int(len(layers_in_plan) * total_experts)
+        keep_ratio_actual = keep_total / total_capacity if total_capacity > 0 else 0.0
+        if n_experts_to_prune is None:
+            # Use a per-layer equivalent prune count for directory naming only.
+            n_experts_to_prune = int(round(total_experts * (1.0 - keep_ratio_actual)))
+        logger.info(
+            "Keep plan effective keep_ratio=%.4f (keep_total=%d / capacity=%d)",
+            keep_ratio_actual,
+            keep_total,
+            total_capacity,
+        )
 
     n_experts_to_prune = prune_args.n_experts_to_prune
     if keep_plan is None:
