@@ -35,9 +35,26 @@ from reap.cluster import (
 from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
 from reap.eval import run_evaluate
 import shutil
+import json
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+def _load_keep_plan(path: str | pathlib.Path) -> dict[str, Any]:
+    p = pathlib.Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"keep_plan_path not found: {p}")
+    with open(p, "r", encoding="utf-8") as f:
+        plan = json.load(f)
+    if not isinstance(plan, dict):
+        raise ValueError("keep plan JSON must be an object")
+    if "keep_counts" not in plan or "layers" not in plan:
+        raise ValueError("keep plan must contain 'layers' and 'keep_counts'")
+    if not isinstance(plan["layers"], list) or not isinstance(plan["keep_counts"], list):
+        raise ValueError("'layers' and 'keep_counts' must be lists")
+    if len(plan["layers"]) != len(plan["keep_counts"]):
+        raise ValueError("'layers' and 'keep_counts' length mismatch")
+    return plan
 
 
 def dump_args_to_yaml(
@@ -122,6 +139,12 @@ def prune(
 
     for layer in tqdm(observer_data, "Pruning layers..."):
         num_experts = observer_data[layer]["expert_frequency"].shape[0]
+        keep_k_for_layer: int | None = None
+        if prune_args.keep_plan_path is not None:
+            raise RuntimeError(
+                "keep_plan_path is only supported via prune_with_keep_plan(); "
+                "this function assumes a uniform n_experts_to_prune across layers."
+            )
         if prune_args.prune_method == "ean_ca":
             ean = torch.zeros(num_experts, device=model.device, dtype=torch.float32)
             for i in range(num_experts):
@@ -205,6 +228,99 @@ def prune(
     logger.info(
         f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"
     )
+    return pruned_model_dir
+
+
+def prune_with_keep_plan(
+    observer_data: dict[int, dict[str, Any]],
+    model,
+    prune_args: PruneArgs,
+    pruned_model_dir: pathlib.Path,
+    keep_plan: dict[str, Any],
+) -> pathlib.Path:
+    model_attrs = MODEL_ATTRS[model.__class__.__name__]
+
+    # Map layer -> keep_k
+    layer_to_keep: dict[int, int] = {}
+    for l, k in zip(keep_plan["layers"], keep_plan["keep_counts"], strict=True):
+        layer_to_keep[int(l)] = int(k)
+
+    # For reproducibility/debuggability, write a manifest of what we kept
+    retained_indices_by_layer: dict[int, list[int]] = {}
+
+    for layer in tqdm(sorted(observer_data.keys()), "Pruning layers (keep plan)..."):
+        num_experts = int(observer_data[layer]["expert_frequency"].shape[0])
+        keep_k = layer_to_keep.get(int(layer))
+        if keep_k is None:
+            raise ValueError(
+                f"Keep plan missing layer {layer}. Present layers: {sorted(layer_to_keep.keys())}"
+            )
+        if not (1 <= keep_k <= num_experts):
+            raise ValueError(
+                f"Invalid keep_k={keep_k} for layer {layer}; must be in [1, {num_experts}]"
+            )
+        if keep_k == num_experts:
+            retained_indices_by_layer[int(layer)] = list(range(num_experts))
+            continue
+
+        prune_method = prune_args.prune_method
+        if prune_method == "frequency":
+            prune_method = "expert_frequency"
+        elif prune_method == "weighted_frequency_sum":
+            prune_method = "weighted_expert_frequency_sum"
+        saliency_data = observer_data[layer].get(prune_method)
+        if saliency_data is None:
+            raise ValueError(
+                f"Prune method {prune_args.prune_method} not found in observer data for layer {layer}. "
+                f"Available keys: {list(observer_data[layer].keys())}"
+            )
+
+        # Keep top-k by saliency, but preserve original expert ordering (stable indices)
+        keep_idx = torch.topk(saliency_data, keep_k, largest=True).indices
+        keep_idx = torch.sort(keep_idx).values
+        retained = keep_idx.tolist()
+        retained_indices_by_layer[int(layer)] = retained
+
+        moe = get_moe(model, layer)
+        if not model_attrs["fused"]:
+            all_experts = getattr(moe, model_attrs["experts"])
+            retained_experts = [all_experts[i] for i in retained]
+            setattr(moe, model_attrs["experts"], torch.nn.ModuleList(retained_experts))
+
+            # prune router
+            router = getattr(moe, model_attrs["router"])
+            router.weight.data = router.weight.data[retained, :]
+            if getattr(router, "bias", None) is not None:
+                router.bias.data = router.bias.data[retained]
+            router.out_features = len(retained)
+            setattr(moe, model_attrs["router"], router)
+
+            # Best-effort: keep internal counters consistent if present
+            if hasattr(moe, "num_experts"):
+                moe.num_experts = len(retained)
+            if hasattr(router, "num_experts"):
+                router.num_experts = len(retained)
+        else:
+            raise NotImplementedError(
+                "keep_plan pruning for fused experts is not implemented."
+            )
+
+    # Save: note that loading this model requires a compatible model implementation
+    # that instantiates per-layer expert counts. We persist metadata to make that possible.
+    pruned_model_dir.mkdir(parents=True, exist_ok=True)
+    model.config.reap_num_experts_per_layer = [layer_to_keep[i] for i in sorted(layer_to_keep)]
+    manifest = {
+        "keep_plan_path": str(prune_args.keep_plan_path),
+        "prune_method": prune_args.prune_method,
+        "layers": sorted(retained_indices_by_layer.keys()),
+        "keep_counts": [layer_to_keep[i] for i in sorted(retained_indices_by_layer)],
+        "retained_indices_by_layer": retained_indices_by_layer,
+    }
+    with open(pruned_model_dir / "reap_keep_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    logger.info("Saving pruned model (keep plan)...")
+    model.save_pretrained(pruned_model_dir)
     return pruned_model_dir
 
 
@@ -297,18 +413,32 @@ def main():
         )
 
     total_experts = len(observer_data[next(iter(observer_data))]["expert_frequency"])
+
+    keep_plan = None
+    if prune_args.keep_plan_path is not None:
+        keep_plan = _load_keep_plan(prune_args.keep_plan_path)
+        metric_in_plan = keep_plan.get("metric")
+        if metric_in_plan is not None and metric_in_plan != prune_args.prune_method:
+            logger.warning(
+                "Keep plan metric is '%s' but --prune-method is '%s'. "
+                "Experts will be ranked by --prune-method.",
+                metric_in_plan,
+                prune_args.prune_method,
+            )
+
     n_experts_to_prune = prune_args.n_experts_to_prune
-    if n_experts_to_prune is None:
-        if cluster_args.compression_ratio is None:
-            raise ValueError(
-                "Either n_experts_to_prune or compression_ratio must be set for pruning."
-            )
-        else:
-            # Calculate n_experts_to_prune from compression_ratio
-            n_experts_to_prune = int(total_experts * cluster_args.compression_ratio)
-            logger.info(
-                f"Calculated n_experts to prune: {n_experts_to_prune} from compression_ratio: {cluster_args.compression_ratio}"
-            )
+    if keep_plan is None:
+        if n_experts_to_prune is None:
+            if cluster_args.compression_ratio is None:
+                raise ValueError(
+                    "Either n_experts_to_prune or compression_ratio must be set for pruning."
+                )
+            else:
+                # Calculate n_experts_to_prune from compression_ratio
+                n_experts_to_prune = int(total_experts * cluster_args.compression_ratio)
+                logger.info(
+                    f"Calculated n_experts to prune: {n_experts_to_prune} from compression_ratio: {cluster_args.compression_ratio}"
+                )
 
     pruned_model_dir = get_pruned_model_dir(
         results_dir, n_experts_to_prune, total_experts, prune_args, reap_args.seed, obs_args.renormalize_router_weights
@@ -323,16 +453,29 @@ def main():
             "Skipping pruning step."
         )
     else:
-        logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
-        prune(
-            observer_data,
-            model,
-            tokenizer,
-            reap_args,
-            prune_args,
-            n_experts_to_prune,
-            pruned_model_dir,
-        )
+        if keep_plan is not None:
+            logger.info(
+                "Pruning with keep plan: %s (variable experts per layer).",
+                prune_args.keep_plan_path,
+            )
+            prune_with_keep_plan(
+                observer_data=observer_data,
+                model=model,
+                prune_args=prune_args,
+                pruned_model_dir=pruned_model_dir,
+                keep_plan=keep_plan,
+            )
+        else:
+            logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
+            prune(
+                observer_data,
+                model,
+                tokenizer,
+                reap_args,
+                prune_args,
+                n_experts_to_prune,
+                pruned_model_dir,
+            )
         logger.info("pruning completed.")
 
         # smoke test

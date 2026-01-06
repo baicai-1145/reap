@@ -531,6 +531,17 @@ class PruneArgs:
             )
         }
     )
+    keep_plan_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional path to a JSON keep plan produced by scripts/plot_observations.py "
+                "(e.g., reap_keep_plan_keep0.25.json). If set, pruning will keep a "
+                "different number of experts per layer according to keep_counts, while "
+                "ranking experts within each layer by --prune-method."
+            )
+        },
+    )
 
 @dataclass
 class QuantizationArgs:
