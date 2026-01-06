@@ -252,14 +252,19 @@ def main():
     # get local patched model if req'd
     model_name = patched_model_map(model_args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
     # load model
+    logger.info("Loading model into RAM (this may take a few minutes)...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        device_map="auto",
+        device_map={"": "cpu"},
         torch_dtype="auto",
         trust_remote_code=True,
+        low_cpu_mem_usage=True,
         local_files_only=True,
     )
+    model.target_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    logger.info(f"Model loaded into RAM. Target compute device: {model.target_device}")
     # record activations or load previously recorded activations
     logger.info(
         f"Running observer to collect activation data for model {model_args.model_name} on dataset {ds_args.dataset_name}."

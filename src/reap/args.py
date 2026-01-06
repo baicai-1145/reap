@@ -114,6 +114,10 @@ class ObserverArgs:
     model_max_length: int | None = 2048
     return_vllm_tokens_prompt: bool = False
     truncate: bool = False
+    batch_size: int = field(
+        default=1,
+        metadata={"help": "Batch size for observation."}
+    )
     overwrite_observations: bool = field(
         default=False,
         metadata={"help": "Whether to overwrite existing observer data files."},

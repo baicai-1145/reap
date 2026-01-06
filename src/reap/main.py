@@ -214,13 +214,14 @@ def record_activations(
             # 1. Initial Hidden States (Embeddings)
             all_samples = torch.cat(cat_data, dim=0) # (TotalSamples, SeqLen)
             num_total_samples = all_samples.shape[0]
-            batch_size = 4 # Reduced to 4 to save base VRAM and prevent OOM
+            batch_size = obs_args.batch_size # Dynamically use the batch size from args
             seq_len = all_samples.shape[1]
             
             # Prepare Attention Mask (typically all ones for calibration if no padding)
             # and position embeddings
             # Base causal mask (2D: SeqLen x SeqLen)
-            causal_mask = torch.full((seq_len, seq_len), fill_value=float("-inf"), device=model.device, dtype=model.dtype)
+            target_device = getattr(model, "target_device", torch.device("cuda:0"))
+            causal_mask = torch.full((seq_len, seq_len), fill_value=float("-inf"), device=target_device, dtype=model.dtype)
             causal_mask = torch.triu(causal_mask, diagonal=1)
 
             h_states = []
@@ -230,161 +231,140 @@ def record_activations(
                 h = model.model.embed_tokens(batch)
                 h_states.append(h.cpu())
                 del batch
-            h_states = torch.cat(h_states, dim=0) # (TotalSamples, SeqLen, Hidden) -> in RAM
+            h_states = torch.cat(h_states, dim=0)
+            target_device = getattr(model, "target_device", torch.device("cuda:0"))
+            
+            # Buffer Optimization: Use two GPU buffers to eliminate ALL CPU-GPU traffic
+            # 32GB (Input) + 32GB (Output) = 64GB. With 1 layer (3.3GB) = 67.3GB. 
+            # Safe for H100 (80GB).
+            logger.info(f"Moving activations to GPU buffers (64GB total)...")
+            h_states = h_states.to(target_device)
+            next_h_states_buffer = torch.empty_like(h_states)
+            
+            # Stream for asynchronous weight loading
+            load_stream = torch.cuda.Stream(device=target_device)
             
             # 2. Iterate through layers
             num_layers = len(model.model.layers)
-            for l_idx, layer in enumerate(tqdm(model.model.layers, desc="Processing Layers")):
-                # a. Pre-MoE: Attention and Norms
-                next_h_states = []
-                moe_inputs = []
-                
-                # Non-MoE part (Attention + Norm) is fast, run in batches
-                for i in range(0, num_total_samples, batch_size):
-                    batch_h = h_states[i:i+batch_size].to(model.device)
-                    current_batch_size = batch_h.shape[0]
-                    
-                    # Prepare RoPE and Mask for this batch
-                    position_ids = torch.arange(seq_len, device=model.device).expand(current_batch_size, -1)
-                    pos_emb = model.model.rotary_emb(batch_h, position_ids)
-                    
-                    # Correctly expand mask for current batch size: (Batch, 1, Seq, Seq)
-                    current_mask = causal_mask.view(1, 1, seq_len, seq_len).expand(current_batch_size, 1, -1, -1)
+            num_experts = model.config.num_experts
+            
+            # Initial load for first layer
+            model.model.layers[0].to(target_device)
 
-                    residual = batch_h
-                    hidden_states = layer.input_layernorm(batch_h)
-                    
-                    if hasattr(layer, "linear_attn"):
-                        # Linear attention (GatedDeltaNet) doesn't take position_embeddings
-                        # It might take attention_mask, but let's be safe and check or use positional args if needed
-                        # Based on the error, it definitely doesn't like 'position_embeddings'
-                        hidden_states = layer.linear_attn(
-                            hidden_states, 
-                            attention_mask=current_mask
-                        )[0]
-                    else:
-                        # Full attention (Qwen3NextAttention) needs both
-                        hidden_states = layer.self_attn(
-                            hidden_states,
-                            attention_mask=current_mask,
-                            position_embeddings=pos_emb
-                        )[0]
-                    
-                    hidden_states = residual + hidden_states
-                    
-                    residual = hidden_states
-                    moe_input = layer.post_attention_layernorm(hidden_states)
-                    
-                    moe_inputs.append(moe_input.cpu())
-                    next_h_states.append(residual.cpu())
-                    del batch_h, hidden_states, moe_input, pos_emb, position_ids
-                
-                moe_inputs = torch.cat(moe_inputs, dim=0) # (TotalSamples, SeqLen, Hidden) -> in RAM
-                next_h_states = torch.cat(next_h_states, dim=0) # (TotalSamples, SeqLen, Hidden) -> in RAM
-                
-                # b. MoE Stage (The bottleneck)
-                # This is where we do Expert-wise for ALL samples at once
+            # Use tqdm for the outer loop so you can see progress
+            pbar = tqdm(range(num_layers), desc="Processing Layers")
+            for l_idx in pbar:
+                layer = model.model.layers[l_idx]
                 moe_block = layer.mlp
-                total_tokens = moe_inputs.shape[0] * moe_inputs.shape[1]
-                flat_moe_inputs = moe_inputs.view(total_tokens, -1)
                 
-                # i. Router (Run in one or two batches)
-                router_logits = []
-                router_batch_size = 4096 # Large batch for linear layer
-                for i in range(0, total_tokens, router_batch_size):
-                    batch_in = flat_moe_inputs[i:i+router_batch_size].to(model.device)
-                    logits = moe_block.gate(batch_in)
-                    router_logits.append(logits.cpu())
-                    del batch_in, logits
-                router_logits = torch.cat(router_logits, dim=0) # (TotalTokens, NumExperts)
-                
-                # Trigger Observer metrics manually (since we are bypassing the hook)
-                # But to stay KISS, let's just use the logic from observer.py
-                top_k = model.config.num_experts_per_tok
-                num_experts = model.config.num_experts
-                
-                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                routing_weights = torch.nn.functional.softmax(router_logits, dim=-1)
-                
-                # Collect MoE Output
-                moe_outputs = torch.zeros_like(flat_moe_inputs) # (TotalTokens, Hidden)
-                
-                # Add Shared Expert contribution first
-                if hasattr(moe_block, "shared_expert"):
-                    logger.debug(f"Layer {l_idx}: Computing shared expert...")
-                    for i in range(0, total_tokens, batch_size * 128):
-                        batch_in = flat_moe_inputs[i:i+batch_size*128].to(model.device)
-                        shared_out = moe_block.shared_expert(batch_in)
-                        shared_gate = torch.sigmoid(moe_block.shared_expert_gate(batch_in))
-                        moe_outputs[i:i+batch_size*128] = (shared_out * shared_gate).cpu()
-                        del batch_in, shared_out, shared_gate
-                    torch.cuda.empty_cache()
+                # PREFETCH NEXT LAYER: While computing current, load next
+                if l_idx + 1 < num_layers:
+                    with torch.cuda.stream(load_stream):
+                        model.model.layers[l_idx + 1].to(target_device, non_blocking=True)
 
-                # ii. EXPERT-WISE LOOP (The PCIe Savior)
-                for exp_idx in tqdm(range(num_experts), desc=f"Layer {l_idx} Experts", leave=False):
-                    token_indices, _ = torch.where(selected_experts == exp_idx)
-                    if token_indices.numel() == 0:
-                        continue
+                total_tokens = num_total_samples * seq_len
+                # Reduced chunk size to 48k to give GPU more "breathing room" (prevents fragmentation slowdown)
+                token_chunk_size = 128 * 1024 
+                flat_h_states = h_states.view(total_tokens, -1)
+                flat_next_h_states = next_h_states_buffer.view(total_tokens, -1)
+
+                for c_start in range(0, total_tokens, token_chunk_size):
+                    c_end = min(c_start + token_chunk_size, total_tokens)
+                    chunk_len = c_end - c_start
+                    chunk_h = flat_h_states[c_start:c_end]
                     
-                    # LOAD EXPERT ONCE, RUN ALL TOKENS
-                    expert = moe_block.experts[exp_idx]
-                    # FORCE WEIGHTS TO GPU MANUALLY
-                    expert.to(model.device)
+                    temp_batch_size = (chunk_len + seq_len - 1) // seq_len
+                    chunk_h_padded = torch.nn.functional.pad(chunk_h, (0, 0, 0, temp_batch_size * seq_len - chunk_len))
+                    chunk_h_reshaped = chunk_h_padded.view(temp_batch_size, seq_len, -1)
                     
-                    expert_input = flat_moe_inputs[token_indices].to(model.device)
-                    expert_out = expert(expert_input) # (NumActive, Hidden)
-                    
-                    # Accumulate metrics (similar to observer logic)
-                    exp_weights = routing_weights[token_indices, exp_idx].to(model.device)
-                    ean_norm = torch.linalg.norm(expert_out, dim=-1)
-                    
-                    # Update observer state (manually since we bypass hooks)
-                    if l_idx not in observer.state:
-                        observer.state[l_idx] = observer._initialize_state((moe_inputs[0:1],), num_experts)
-                    
-                    obs_state = observer.state[l_idx]
-                    obs_state["ean_sum"][exp_idx] += ean_norm.sum().cpu()
-                    obs_state["weighted_ean_sum"][exp_idx] += (ean_norm * exp_weights).sum().cpu()
-                    obs_state["expert_frequency"][exp_idx] += token_indices.numel()
-                    
-                    # Update trackers
-                    single_ean_mean = torch.zeros(num_experts, device="cpu")
-                    single_ean_mean[exp_idx] = ean_norm.mean().cpu()
-                    single_freq = torch.zeros(num_experts, dtype=torch.long, device="cpu")
-                    single_freq[exp_idx] = token_indices.numel()
-                    obs_state["ean_mean"].update(single_ean_mean, single_freq)
-                    
-                    single_reap = torch.zeros(num_experts, device="cpu")
-                    single_reap[exp_idx] = (ean_norm * exp_weights).mean().cpu()
-                    obs_state["reap"].update(single_reap, single_freq)
-                    
-                    obs_state["weighted_expert_frequency_sum"][exp_idx] += exp_weights.sum().cpu()
-                    
-                    # Max activations
-                    m_act = expert_out.max().cpu()
-                    if m_act > obs_state["max_activations"][exp_idx]:
-                        obs_state["max_activations"][exp_idx] = m_act
-                    
-                    # Add to moe_outputs for next layer
-                    # Note: Qwen3Next uses weighted sum
-                    moe_outputs[token_indices] += (expert_out * exp_weights.unsqueeze(-1)).cpu()
-                    
-                    # FORCE WEIGHTS BACK TO CPU IMMEDIATELY
-                    expert.to("cpu")
-                    
-                    del expert_input, expert_out, exp_weights, ean_norm
-                    
-                    # Periodic cache clearing every 32 experts (more aggressive for 32GB)
-                    if exp_idx % 32 == 0:
-                        torch.cuda.empty_cache()
-                
-                # Finalize layer output: next_h_states = residual + moe_output
-                h_states = (next_h_states.view(total_tokens, -1) + moe_outputs).view(num_total_samples, -1, model.config.hidden_size)
+                    with torch.no_grad():
+                        # Attention Stage
+                        residual = chunk_h_reshaped
+                        hidden_states = layer.input_layernorm(chunk_h_reshaped)
+                        
+                        current_mask = causal_mask.view(1, 1, seq_len, seq_len).expand(temp_batch_size, 1, -1, -1)
+                        position_ids = torch.arange(seq_len, device=target_device).expand(temp_batch_size, -1)
+                        pos_emb = model.model.rotary_emb(hidden_states, position_ids)
+
+                        if hasattr(layer, "linear_attn"):
+                            hidden_states = layer.linear_attn(hidden_states, attention_mask=current_mask)[0]
+                        else:
+                            hidden_states = layer.self_attn(hidden_states, attention_mask=current_mask, position_embeddings=pos_emb)[0]
+                        
+                        hidden_states = residual + hidden_states
+                        residual = hidden_states
+                        moe_input = layer.post_attention_layernorm(hidden_states)
+                        
+                        # MoE Stage
+                        moe_input_flat = moe_input.view(-1, model.config.hidden_size)[:chunk_len]
+                        router_logits = moe_block.gate(moe_input_flat)
+                        
+                        top_k = model.config.num_experts_per_tok
+                        routing_weights = torch.nn.functional.softmax(router_logits, dim=-1)
+                        _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+                        
+                        moe_out_chunk = torch.zeros_like(moe_input_flat)
+                        
+                        c_ean_sum = torch.zeros(num_experts, device=target_device)
+                        c_w_ean_sum = torch.zeros(num_experts, device=target_device)
+                        c_freq = torch.zeros(num_experts, device=target_device)
+                        c_max_act = torch.zeros(num_experts, device=target_device)
+
+                        if hasattr(moe_block, "shared_expert"):
+                            shared_out = moe_block.shared_expert(moe_input_flat)
+                            shared_gate = torch.sigmoid(moe_block.shared_expert_gate(moe_input_flat))
+                            moe_out_chunk += (shared_out * shared_gate)
+
+                        # Expert Sort Optimization
+                        flat_selected_experts = selected_experts.view(-1)
+                        expert_ids, token_indices_in_chunk = torch.sort(flat_selected_experts)
+                        tokens_per_expert = torch.bincount(expert_ids, minlength=num_experts)
+                        expert_offsets = torch.cumsum(tokens_per_expert, dim=0) - tokens_per_expert
+
+                        for exp_idx in range(num_experts):
+                            num_tokens = tokens_per_expert[exp_idx].item()
+                            if num_tokens == 0: continue
+                            
+                            start_off = expert_offsets[exp_idx].item()
+                            chunk_token_idx = token_indices_in_chunk[start_off : start_off + num_tokens] // top_k
+                            
+                            expert_out = moe_block.experts[exp_idx](moe_input_flat[chunk_token_idx])
+                            exp_weights = routing_weights.view(-1)[token_indices_in_chunk[start_off : start_off + num_tokens]].unsqueeze(-1)
+                            
+                            moe_out_chunk.index_add_(0, chunk_token_idx, expert_out * exp_weights)
+                            
+                            ean_norm = torch.linalg.norm(expert_out, dim=-1)
+                            c_ean_sum[exp_idx] += ean_norm.sum()
+                            c_w_ean_sum[exp_idx] += (ean_norm * exp_weights.squeeze()).sum()
+                            c_freq[exp_idx] += num_tokens
+                            c_max_act[exp_idx] = torch.max(c_max_act[exp_idx], expert_out.max())
+
+                        if l_idx not in observer.state:
+                            observer.state[l_idx] = observer._initialize_state((moe_input_flat[0:1],), num_experts)
+                        obs_state = observer.state[l_idx]
+                        obs_state["ean_sum"] += c_ean_sum.cpu()
+                        obs_state["weighted_ean_sum"] += c_w_ean_sum.cpu()
+                        obs_state["expert_frequency"] += c_freq.cpu().long()
+                        obs_state["weighted_expert_frequency_sum"] += c_w_ean_sum.cpu()
+                        obs_state["max_activations"] = torch.max(obs_state["max_activations"], c_max_act.cpu())
+                            
+                        flat_next_h_states[c_start:c_end] = (residual.view(-1, model.config.hidden_size)[:chunk_len] + moe_out_chunk)
+
+                # Swap Buffers
+                h_states, next_h_states_buffer = next_h_states_buffer, h_states
                 obs_state["total_tokens"] += total_tokens
                 
-                del moe_inputs, next_h_states, moe_outputs, router_logits, selected_experts, routing_weights
-                gc.collect()
-                torch.cuda.empty_cache()
+                # Offload current layer asynchronously
+                with torch.cuda.stream(load_stream):
+                    layer.to("cpu", non_blocking=True)
+                
+                # Periodic cache clearing to combat fragmentation every 8 layers
+                if l_idx % 8 == 0:
+                    torch.cuda.empty_cache()
+                
+                # Synchronize before moving to next layer
+                torch.cuda.synchronize() 
+                # torch.cuda.empty_cache() # Avoid excessive syncing
 
             observer.save_state(f_name)
             logger.info(f"Category '{category}' finished via LEO path.")
@@ -625,24 +605,37 @@ def save_merged_model(
 @torch.no_grad()
 def smoke_test(model: nn.Module, tokenizer: AutoTokenizer):
     """Run a smoke test to ensure the model is functioning correctly."""
+    target_device = getattr(model, "target_device", torch.device("cuda:0"))
+    logger.info(f"Moving model to {target_device} for fast smoke test...")
+    model.to(target_device)
+    
     prompt = "What is your name?"
     test_input = [
         {"role": "user", "content": prompt},
     ]
+    # Use return_dict=True to get both input_ids and attention_mask
     inputs = tokenizer.apply_chat_template(
         test_input,
         return_tensors="pt",
         add_generation_prompt=True,
         tokenize=True,
-        # enable_thinking=False,
-    ).to(model.device)
+        return_dict=True,
+    ).to(target_device)
+    
+    logger.info("Generating response (max 20 tokens)...")
     outputs = model.generate(
-        inputs,
-        max_new_tokens=50,
+        **inputs,
+        max_new_tokens=20,
         do_sample=True,
+        temperature=0.7,
+        pad_token_id=tokenizer.eos_token_id,
+        use_cache=True,
     )
     response = tokenizer.batch_decode(outputs, skip_special_tokens=False)
     logger.info("Smoke test response: %s", response[0])
+    
+    model.to("cpu")
+    torch.cuda.empty_cache()
 
 
 def get_model_dir(
@@ -758,14 +751,26 @@ def main():
     # get local patched model if req'd
     model_name = patched_model_map(model_args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
     # load model
+    logger.info("Loading model into RAM (this may take a few minutes)...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        device_map="auto",
+        device_map={"": "cpu"},
         torch_dtype="auto",
         trust_remote_code=True,
-        # local_files_only=True,
+        low_cpu_mem_usage=True,
+        local_files_only=True,
     )
+    target_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    model.target_device = target_device
+    
+    # PERMANENTLY move shared modules to GPU to save PCIe bandwidth
+    logger.info("Moving shared modules (Embeddings/Norm) to GPU permanently...")
+    model.model.embed_tokens.to(target_device)
+    model.model.rotary_emb.to(target_device)
+    
+    logger.info(f"Model loaded into RAM. Target compute device: {model.target_device}")
 
     # record activations or load previously recorded activations
     logger.info(
