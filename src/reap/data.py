@@ -421,6 +421,42 @@ class WritingPromptsChatDataset(ChatDatasetProcessor):
             ],
         }
 
+class OpenThoughtsByDomainChatDataset(ChatDatasetProcessor):
+    """Local OpenThoughts samples grouped by domain (jsonl files)."""
+
+    category_field: str = "domain"
+
+    @staticmethod
+    def _map_fn(sample: dict[str, any]) -> dict[str, any]:
+        problem = sample.get("problem") or ""
+        starter_code = sample.get("starter_code")
+        test_cases = sample.get("test_cases")
+
+        user_parts = [problem.strip()]
+        if starter_code:
+            user_parts.append(f"Starter code:\n{starter_code}".strip())
+        if test_cases:
+            user_parts.append(f"Test cases:\n{test_cases}".strip())
+        user_content = "\n\n".join([p for p in user_parts if p])
+
+        # Prefer the model-generated solution; fallback to ground-truth.
+        assistant_content = (
+            sample.get("deepseek_solution")
+            or sample.get("ground_truth_solution")
+            or ""
+        )
+
+        out = {
+            "messages": [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": assistant_content},
+            ],
+        }
+        # Preserve domain for category splitting
+        if "domain" in sample:
+            out["domain"] = sample["domain"]
+        return out
+
 
 
 DATASET_REGISTRY: dict[str, BaseDatasetProcessor] = {
@@ -432,4 +468,5 @@ DATASET_REGISTRY: dict[str, BaseDatasetProcessor] = {
     "theblackcat102/evol-codealpaca-v1": CodeAlpacaChatDataset,
     "euclaise/WritingPrompts_curated": WritingPromptsChatDataset,
     "allenai/tulu-3-sft-personas-math": PersonasMathChatDataset,
+    "artifacts/openthoughts_114k_samples_by_domain": OpenThoughtsByDomainChatDataset,
 }

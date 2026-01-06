@@ -83,6 +83,7 @@ class DatasetArgs:
                 "theblackcat102/evol-codealpaca-v1",
                 "euclaise/WritingPrompts_curated",
                 "allenai/tulu-3-sft-personas-math",
+                "artifacts/openthoughts_114k_samples_by_domain",
                 "combined"
             ],
         },

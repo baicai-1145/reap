@@ -123,7 +123,34 @@ def record_activations(
                 f"Combined dataset requested but no pre-recorded data found at {f_name}"
             )
     try:
-        if ds_args.dataset_name == "allenai/c4":
+        ds_path = pathlib.Path(ds_args.dataset_name)
+        if ds_path.exists():
+            if ds_path.is_dir():
+                jsonl_files = sorted(
+                    [str(p) for p in ds_path.glob("*.jsonl")]
+                    + [str(p) for p in ds_path.glob("**/*.jsonl")]
+                )
+                # De-duplicate while preserving order
+                seen = set()
+                jsonl_files = [p for p in jsonl_files if not (p in seen or seen.add(p))]
+                if not jsonl_files:
+                    raise RuntimeError(
+                        f"Local dataset directory has no .jsonl files: {ds_path}"
+                    )
+                raw_ds = load_dataset(
+                    "json",
+                    data_files=jsonl_files,
+                    split="train",
+                    streaming=False,
+                )
+            else:
+                raw_ds = load_dataset(
+                    "json",
+                    data_files={"train": str(ds_path)},
+                    split="train",
+                    streaming=False,
+                )
+        elif ds_args.dataset_name == "allenai/c4":
             file_url = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
             c4_single_file_dataset = load_dataset(
                 "json", data_files={"train": file_url}, split="train", streaming=False
@@ -336,6 +363,9 @@ def record_activations(
                         c_w_ean_sum = torch.zeros(
                             num_experts, device=target_device, dtype=torch.float64
                         )
+                        c_w_ean_sum_l2 = torch.zeros(
+                            num_experts, device=target_device, dtype=torch.float64
+                        )
                         c_w_freq_sum = torch.zeros(
                             num_experts, device=target_device, dtype=torch.float64
                         )
@@ -343,6 +373,11 @@ def record_activations(
                             num_experts, device=target_device, dtype=torch.long
                         )
                         c_max_act = torch.zeros(num_experts, device=target_device)
+                        c_routed_ca_sum = torch.zeros(
+                            (num_experts, model.config.hidden_size),
+                            device=target_device,
+                            dtype=torch.float32,
+                        )
 
                         if hasattr(moe_block, "shared_expert"):
                             shared_out = moe_block.shared_expert(moe_input_flat)
@@ -375,13 +410,20 @@ def record_activations(
                                 torch.float32
                             )
                             exp_w = exp_weights.squeeze(-1).to(torch.float32)
+                            ean_norm_l2 = ean_norm * ean_norm
                             c_ean_sum[exp_idx] += ean_norm.sum().to(torch.float64)
                             c_w_ean_sum[exp_idx] += (ean_norm * exp_w).sum().to(
+                                torch.float64
+                            )
+                            c_w_ean_sum_l2[exp_idx] += (ean_norm_l2 * exp_w).sum().to(
                                 torch.float64
                             )
                             c_w_freq_sum[exp_idx] += exp_w.sum().to(torch.float64)
                             c_freq[exp_idx] += num_tokens
                             c_max_act[exp_idx] = torch.max(c_max_act[exp_idx], expert_out.max())
+                            c_routed_ca_sum[exp_idx] += expert_out.to(torch.float32).sum(
+                                dim=0
+                            )
 
                         if l_idx not in observer.state:
                             observer.state[l_idx] = observer._initialize_state((moe_input_flat[0:1],), num_experts)
@@ -390,6 +432,32 @@ def record_activations(
                         obs_state["weighted_ean_sum"] += c_w_ean_sum.cpu()
                         obs_state["expert_frequency"] += c_freq.cpu()
                         obs_state["weighted_expert_frequency_sum"] += c_w_freq_sum.cpu()
+                        if "weighted_ean_sum_l2" not in obs_state:
+                            obs_state["weighted_ean_sum_l2"] = torch.zeros(
+                                (num_experts,),
+                                device="cpu",
+                                dtype=torch.float64,
+                                requires_grad=False,
+                            )
+                        obs_state["weighted_ean_sum_l2"] += c_w_ean_sum_l2.cpu()
+
+                        if "routed_characteristic_activation_sum" not in obs_state:
+                            obs_state["routed_characteristic_activation_sum"] = torch.zeros(
+                                (num_experts, model.config.hidden_size),
+                                device="cpu",
+                                dtype=torch.float32,
+                                requires_grad=False,
+                            )
+                            obs_state["routed_characteristic_activation_count"] = torch.zeros(
+                                (num_experts,),
+                                device="cpu",
+                                dtype=torch.long,
+                                requires_grad=False,
+                            )
+                        obs_state["routed_characteristic_activation_sum"] += (
+                            c_routed_ca_sum.cpu()
+                        )
+                        obs_state["routed_characteristic_activation_count"] += c_freq.cpu()
                         c_ean_mean = torch.zeros(
                             num_experts, device=target_device, dtype=torch.float32
                         )
@@ -424,6 +492,29 @@ def record_activations(
                 # Synchronize before moving to next layer
                 torch.cuda.synchronize() 
                 # torch.cuda.empty_cache() # Avoid excessive syncing
+
+            # Materialize lightweight derived fields before saving.
+            # We store sums/counts during LEO to minimize per-step work, then convert
+            # to means here so downstream pruning/clustering can consume tensors.
+            for layer_idx, layer_state in observer.state.items():
+                if "routed_characteristic_activation_sum" in layer_state:
+                    cnt = layer_state["routed_characteristic_activation_count"]
+                    denom = cnt.clamp(min=1).unsqueeze(-1).to(torch.float32)
+                    mean = layer_state["routed_characteristic_activation_sum"] / denom
+                    mean[cnt == 0] = 0
+                    layer_state["routed_characteristic_activation"] = mean
+                    del layer_state["routed_characteristic_activation_sum"]
+                    del layer_state["routed_characteristic_activation_count"]
+
+                if "weighted_ean_sum_l2" in layer_state:
+                    ef = layer_state["expert_frequency"].to(torch.float64)
+                    denom = ef.clone()
+                    denom[denom == 0] = 1
+                    reap_l2 = (layer_state["weighted_ean_sum_l2"] / denom).to(
+                        torch.float32
+                    )
+                    reap_l2[ef == 0] = 0
+                    layer_state["reap_l2"] = reap_l2
 
             observer.save_state(f_name)
             logger.info(f"Category '{category}' finished via LEO path.")
