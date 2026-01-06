@@ -102,6 +102,15 @@ def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path
 def record_activations(
     model, tokenizer, reap_args, model_args, ds_args, obs_args, results_dir
 ):
+    def _is_cuda_device(dev) -> bool:
+        if dev is None:
+            return False
+        if isinstance(dev, torch.device):
+            return dev.type == "cuda"
+        if isinstance(dev, str):
+            return dev.startswith("cuda")
+        return False
+
     # Fast path: if not splitting by category, we only use the "all" bucket.
     # If the observations file already exists and overwrite is disabled, load it
     # directly to avoid re-loading the dataset and re-running the model.
@@ -226,6 +235,26 @@ def record_activations(
         model=model,
         hook_config=observer_config,
     )
+
+    if reap_args.profile:
+        # Some architectures (e.g. Qwen3-Next linear attention) require CUDA-only ops
+        # such as causal_conv1d. When the model is loaded on CPU for the LEO path,
+        # running a full forward here will fail. In that case, skip profiling and
+        # rely on the LEO execution path for memory safety.
+        try:
+            target_device = getattr(model, "target_device", None)
+            model_device = getattr(model, "device", None)
+            if _is_cuda_device(target_device) and not _is_cuda_device(model_device):
+                logger.warning(
+                    "Skipping profiling: model is on CPU but target_device is CUDA. "
+                    "Full forward profiling would require moving the entire model to GPU, "
+                    "and may also fail for CUDA-only ops. Use `--profile false` if you "
+                    "want to silence this warning."
+                )
+                observer.reset()
+                reap_args.profile = False
+        except Exception:
+            pass
 
     if reap_args.profile:
         # profile at max len

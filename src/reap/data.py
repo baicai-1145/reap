@@ -197,7 +197,7 @@ class BaseDatasetProcessor(ABC):
             if len(sampled) >= len(category_dataset):
                 logger.warning(
                     f"Not enough samples in category '{category}' to reach "
-                    f"{samples_per_category} samples. Only {len(sampled)} "
+                    f"{samples_per_category} samples. Only {len(processed_samples)} "
                     "samples were processed.",
                 )
                 break
@@ -232,7 +232,7 @@ class BaseDatasetProcessor(ABC):
             if len(sampled) >= len(category_dataset):
                 logger.warning(
                     f"Not enough samples in category '{category}' to reach "
-                    f"{samples_per_category} samples. Only {len(sampled)} "
+                    f"{samples_per_category} samples. Only {len(processed_samples)} "
                     "samples were processed.",
                 )
                 break

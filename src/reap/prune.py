@@ -385,6 +385,12 @@ def main():
     )
     model.target_device = torch.device(f"cuda:{torch.cuda.current_device()}")
     logger.info(f"Model loaded into RAM. Target compute device: {model.target_device}")
+    if reap_args.profile:
+        logger.warning(
+            "Profiling is enabled but the model is loaded on CPU for the LEO path (device_map=cpu). "
+            "Disabling profiling to avoid CUDA-only op failures; use `--profile false` to silence this warning."
+        )
+        reap_args.profile = False
     # record activations or load previously recorded activations
     logger.info(
         f"Running observer to collect activation data for model {model_args.model_name} on dataset {ds_args.dataset_name}."
