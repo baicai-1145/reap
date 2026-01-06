@@ -300,14 +300,36 @@ def record_activations(
                         router_logits = moe_block.gate(moe_input_flat)
                         
                         top_k = model.config.num_experts_per_tok
-                        routing_weights = torch.nn.functional.softmax(router_logits, dim=-1)
+                        routing_weights = torch.nn.functional.softmax(
+                            router_logits, dim=-1, dtype=torch.float32
+                        )
                         _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+                        if renormalize_router_weights:
+                            topk_weights = torch.gather(
+                                routing_weights, 1, selected_experts
+                            )
+                            routing_weights = routing_weights / topk_weights.sum(
+                                dim=-1, keepdim=True
+                            )
+                            routing_weights = torch.clamp(
+                                routing_weights,
+                                min=torch.finfo(routing_weights.dtype).eps,
+                            )
                         
                         moe_out_chunk = torch.zeros_like(moe_input_flat)
                         
-                        c_ean_sum = torch.zeros(num_experts, device=target_device)
-                        c_w_ean_sum = torch.zeros(num_experts, device=target_device)
-                        c_freq = torch.zeros(num_experts, device=target_device)
+                        c_ean_sum = torch.zeros(
+                            num_experts, device=target_device, dtype=torch.float64
+                        )
+                        c_w_ean_sum = torch.zeros(
+                            num_experts, device=target_device, dtype=torch.float64
+                        )
+                        c_w_freq_sum = torch.zeros(
+                            num_experts, device=target_device, dtype=torch.float64
+                        )
+                        c_freq = torch.zeros(
+                            num_experts, device=target_device, dtype=torch.long
+                        )
                         c_max_act = torch.zeros(num_experts, device=target_device)
 
                         if hasattr(moe_block, "shared_expert"):
@@ -329,13 +351,23 @@ def record_activations(
                             chunk_token_idx = token_indices_in_chunk[start_off : start_off + num_tokens] // top_k
                             
                             expert_out = moe_block.experts[exp_idx](moe_input_flat[chunk_token_idx])
-                            exp_weights = routing_weights.view(-1)[token_indices_in_chunk[start_off : start_off + num_tokens]].unsqueeze(-1)
+                            exp_weights = routing_weights[chunk_token_idx, exp_idx].unsqueeze(-1)
                             
-                            moe_out_chunk.index_add_(0, chunk_token_idx, expert_out * exp_weights)
+                            moe_out_chunk.index_add_(
+                                0,
+                                chunk_token_idx,
+                                expert_out * exp_weights.to(expert_out.dtype),
+                            )
                             
-                            ean_norm = torch.linalg.norm(expert_out, dim=-1)
-                            c_ean_sum[exp_idx] += ean_norm.sum()
-                            c_w_ean_sum[exp_idx] += (ean_norm * exp_weights.squeeze()).sum()
+                            ean_norm = torch.linalg.norm(expert_out, dim=-1).to(
+                                torch.float32
+                            )
+                            exp_w = exp_weights.squeeze(-1).to(torch.float32)
+                            c_ean_sum[exp_idx] += ean_norm.sum().to(torch.float64)
+                            c_w_ean_sum[exp_idx] += (ean_norm * exp_w).sum().to(
+                                torch.float64
+                            )
+                            c_w_freq_sum[exp_idx] += exp_w.sum().to(torch.float64)
                             c_freq[exp_idx] += num_tokens
                             c_max_act[exp_idx] = torch.max(c_max_act[exp_idx], expert_out.max())
 
@@ -344,8 +376,23 @@ def record_activations(
                         obs_state = observer.state[l_idx]
                         obs_state["ean_sum"] += c_ean_sum.cpu()
                         obs_state["weighted_ean_sum"] += c_w_ean_sum.cpu()
-                        obs_state["expert_frequency"] += c_freq.cpu().long()
-                        obs_state["weighted_expert_frequency_sum"] += c_w_ean_sum.cpu()
+                        obs_state["expert_frequency"] += c_freq.cpu()
+                        obs_state["weighted_expert_frequency_sum"] += c_w_freq_sum.cpu()
+                        c_ean_mean = torch.zeros(
+                            num_experts, device=target_device, dtype=torch.float32
+                        )
+                        c_reap = torch.zeros(
+                            num_experts, device=target_device, dtype=torch.float32
+                        )
+                        nonzero = c_freq > 0
+                        c_ean_mean[nonzero] = (c_ean_sum[nonzero] / c_freq[nonzero]).to(
+                            torch.float32
+                        )
+                        c_reap[nonzero] = (c_w_ean_sum[nonzero] / c_freq[nonzero]).to(
+                            torch.float32
+                        )
+                        obs_state["ean_mean"].update(c_ean_mean.cpu(), c_freq.cpu())
+                        obs_state["reap"].update(c_reap.cpu(), c_freq.cpu())
                         obs_state["max_activations"] = torch.max(obs_state["max_activations"], c_max_act.cpu())
                             
                         flat_next_h_states[c_start:c_end] = (residual.view(-1, model.config.hidden_size)[:chunk_len] + moe_out_chunk)
@@ -368,6 +415,7 @@ def record_activations(
 
             observer.save_state(f_name)
             logger.info(f"Category '{category}' finished via LEO path.")
+            observer.reset()
 
     return observer.report_state()
 

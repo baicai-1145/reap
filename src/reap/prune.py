@@ -133,6 +133,8 @@ def prune(
             prune_method = prune_args.prune_method
             if prune_method == "frequency":
                 prune_method = "expert_frequency"
+            elif prune_method == "weighted_frequency_sum":
+                prune_method = "weighted_expert_frequency_sum"
             saliency_data = observer_data[layer].get(prune_method)
             if saliency_data is None:
                 raise ValueError(
