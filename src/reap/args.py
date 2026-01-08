@@ -115,6 +115,16 @@ class ObserverArgs:
     model_max_length: int | None = 2048
     return_vllm_tokens_prompt: bool = False
     truncate: bool = False
+    observer_path: str = field(
+        default="leo",
+        metadata={
+            "help": (
+                "Observation execution path. 'leo' is the layer-wise streaming path optimized "
+                "for large models; 'legacy' runs a normal forward pass and relies on hooks."
+            ),
+            "choices": ["leo", "legacy"],
+        },
+    )
     batch_size: int = field(
         default=1,
         metadata={"help": "Batch size for observation."}

@@ -54,6 +54,15 @@ def _load_keep_plan(path: str | pathlib.Path) -> dict[str, Any]:
         raise ValueError("'layers' and 'keep_counts' must be lists")
     if len(plan["layers"]) != len(plan["keep_counts"]):
         raise ValueError("'layers' and 'keep_counts' length mismatch")
+    # Optional: explicit indices per layer, aligned with layers
+    if "keep_indices_by_layer" in plan:
+        if not isinstance(plan["keep_indices_by_layer"], list):
+            raise ValueError("'keep_indices_by_layer' must be a list when provided")
+        if len(plan["keep_indices_by_layer"]) != len(plan["layers"]):
+            raise ValueError("'keep_indices_by_layer' and 'layers' length mismatch")
+        for idxs in plan["keep_indices_by_layer"]:
+            if not isinstance(idxs, list):
+                raise ValueError("each entry in 'keep_indices_by_layer' must be a list")
     return plan
 
 
@@ -245,6 +254,11 @@ def prune_with_keep_plan(
     for l, k in zip(keep_plan["layers"], keep_plan["keep_counts"], strict=True):
         layer_to_keep[int(l)] = int(k)
 
+    keep_indices_map: dict[int, list[int]] = {}
+    if "keep_indices_by_layer" in keep_plan:
+        for l, idxs in zip(keep_plan["layers"], keep_plan["keep_indices_by_layer"], strict=True):
+            keep_indices_map[int(l)] = [int(i) for i in idxs]
+
     # For reproducibility/debuggability, write a manifest of what we kept
     retained_indices_by_layer: dict[int, list[int]] = {}
 
@@ -259,26 +273,40 @@ def prune_with_keep_plan(
             raise ValueError(
                 f"Invalid keep_k={keep_k} for layer {layer}; must be in [1, {num_experts}]"
             )
-        if keep_k == num_experts:
+        if keep_k == num_experts and int(layer) not in keep_indices_map:
             retained_indices_by_layer[int(layer)] = list(range(num_experts))
             continue
 
-        prune_method = prune_args.prune_method
-        if prune_method == "frequency":
-            prune_method = "expert_frequency"
-        elif prune_method == "weighted_frequency_sum":
-            prune_method = "weighted_expert_frequency_sum"
-        saliency_data = observer_data[layer].get(prune_method)
-        if saliency_data is None:
-            raise ValueError(
-                f"Prune method {prune_args.prune_method} not found in observer data for layer {layer}. "
-                f"Available keys: {list(observer_data[layer].keys())}"
-            )
+        if int(layer) in keep_indices_map:
+            retained = keep_indices_map[int(layer)]
+            if len(retained) != keep_k:
+                raise ValueError(
+                    f"Keep plan layer {layer} keep_counts={keep_k} but keep_indices_by_layer has {len(retained)} indices"
+                )
+            if any((i < 0 or i >= num_experts) for i in retained):
+                raise ValueError(f"Keep plan layer {layer} has out-of-range expert indices")
+            retained = sorted(set(int(i) for i in retained))
+            if len(retained) != keep_k:
+                raise ValueError(
+                    f"Keep plan layer {layer} has duplicate indices after normalization"
+                )
+        else:
+            prune_method = prune_args.prune_method
+            if prune_method == "frequency":
+                prune_method = "expert_frequency"
+            elif prune_method == "weighted_frequency_sum":
+                prune_method = "weighted_expert_frequency_sum"
+            saliency_data = observer_data[layer].get(prune_method)
+            if saliency_data is None:
+                raise ValueError(
+                    f"Prune method {prune_args.prune_method} not found in observer data for layer {layer}. "
+                    f"Available keys: {list(observer_data[layer].keys())}"
+                )
 
-        # Keep top-k by saliency, but preserve original expert ordering (stable indices)
-        keep_idx = torch.topk(saliency_data, keep_k, largest=True).indices
-        keep_idx = torch.sort(keep_idx).values
-        retained = keep_idx.tolist()
+            # Keep top-k by saliency, but preserve original expert ordering (stable indices)
+            keep_idx = torch.topk(saliency_data, keep_k, largest=True).indices
+            keep_idx = torch.sort(keep_idx).values
+            retained = keep_idx.tolist()
         retained_indices_by_layer[int(layer)] = retained
 
         moe = get_moe(model, layer)
@@ -374,18 +402,33 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
     # load model
+    observer_path = getattr(obs_args, "observer_path", "leo")
+    if isinstance(observer_path, str):
+        observer_path = observer_path.strip().lower()
+    if observer_path not in ("leo", "legacy"):
+        raise ValueError(f"Invalid --observer_path {observer_path!r}; expected 'leo' or 'legacy'.")
+
     logger.info("Loading model into RAM (this may take a few minutes)...")
+    if observer_path == "legacy" and torch.cuda.is_available():
+        device_map = {"": f"cuda:{torch.cuda.current_device()}"}
+    else:
+        device_map = {"": "cpu"}
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        device_map={"": "cpu"},
+        device_map=device_map,
         torch_dtype="auto",
         trust_remote_code=True,
         low_cpu_mem_usage=True,
         local_files_only=True,
     )
-    model.target_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    model.target_device = (
+        torch.device(f"cuda:{torch.cuda.current_device()}")
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
     logger.info(f"Model loaded into RAM. Target compute device: {model.target_device}")
-    if reap_args.profile:
+    if reap_args.profile and observer_path == "leo" and getattr(model, "device", torch.device("cpu")).type == "cpu":
         logger.warning(
             "Profiling is enabled but the model is loaded on CPU for the LEO path (device_map=cpu). "
             "Disabling profiling to avoid CUDA-only op failures; use `--profile false` to silence this warning."

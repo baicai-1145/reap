@@ -296,6 +296,65 @@ def record_activations(
                 last_saved_path = f_name
                 continue
 
+            observer_path = getattr(obs_args, "observer_path", "leo")
+            if isinstance(observer_path, str):
+                observer_path = observer_path.strip().lower()
+            if observer_path not in ("leo", "legacy"):
+                raise ValueError(
+                    f"Invalid observer_path={observer_path!r}; expected 'leo' or 'legacy'."
+                )
+
+            if observer_path == "legacy":
+                logger.info("No previous data found. Starting legacy observer path (hooks + normal forward)...")
+
+                if obs_args.return_vllm_tokens_prompt:
+                    raise ValueError(
+                        "legacy observer path requires token tensors; set --return_vllm_tokens_prompt false."
+                    )
+
+                target_device = getattr(model, "target_device", None)
+                run_device = getattr(model, "device", torch.device("cpu"))
+                if _is_cuda_device(target_device):
+                    run_device = target_device
+
+                if not isinstance(run_device, torch.device):
+                    run_device = torch.device(str(run_device))
+
+                if getattr(model, "device", None) != run_device:
+                    logger.info("Moving model to %s for legacy observation...", run_device)
+                    model.to(run_device)
+
+                batch_size = int(getattr(obs_args, "batch_size", 1) or 1)
+                for i in tqdm(range(0, len(cat_data), batch_size), desc="Legacy forward"):
+                    batch_items = cat_data[i : i + batch_size]
+                    if not batch_items:
+                        continue
+
+                    if isinstance(batch_items[0], torch.Tensor):
+                        input_ids = torch.cat(batch_items, dim=0)
+                    elif isinstance(batch_items[0], dict) and "input_ids" in batch_items[0]:
+                        input_ids = torch.cat([x["input_ids"] for x in batch_items], dim=0)
+                    else:
+                        raise TypeError(
+                            f"Unsupported sample type for legacy path: {type(batch_items[0]).__name__}"
+                        )
+
+                    input_ids = input_ids.to(run_device)
+                    attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=run_device)
+
+                    try:
+                        _ = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                    except TypeError:
+                        _ = model(input_ids=input_ids, attention_mask=attention_mask)
+
+                    del input_ids, attention_mask
+
+                observer.save_state(f_name)
+                logger.info(f"Category '{category}' finished via legacy path.")
+                observer.reset()
+                last_saved_path = f_name
+                continue
+
             logger.info("No previous data found. Starting LEO (Layer-wise Expert-wise Observation) optimized path...")
             
             # 1. Initial Hidden States (Embeddings)
