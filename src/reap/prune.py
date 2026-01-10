@@ -32,7 +32,14 @@ from reap.cluster import (
     hierarchical_clustering,
     dynamic_frequency_penalized_clustering,
 )
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
+from reap.model_util import (
+    get_moe,
+    assert_merge,
+    MODEL_ATTRS,
+    patched_model_map,
+    get_super_expert_indices,
+    get_prune_moe_spec,
+)
 from reap.eval import run_evaluate
 import shutil
 import json
@@ -117,7 +124,8 @@ def prune(
     """
     Prune the model based on the observer data and clustering.
     """
-    model_attrs = MODEL_ATTRS[model.__class__.__name__]
+    model_attrs = MODEL_ATTRS.get(model.__class__.__name__)
+    prune_spec = get_prune_moe_spec(model)
 
     for layer in observer_data:
         if "expert_proba" not in observer_data[layer]:
@@ -182,11 +190,11 @@ def prune(
         ]
         # prune experts
         moe = get_moe(model, layer)
-        if not model_attrs["fused"]:
-            all_experts = getattr(moe, model_attrs["experts"])
+        if not prune_spec.fused:
+            all_experts = getattr(moe, prune_spec.experts)
             retained_experts = [all_experts[i] for i in retained_expert_indicies]
             retained_experts = torch.nn.ModuleList(retained_experts)
-            setattr(moe, model_attrs["experts"], retained_experts)
+            setattr(moe, prune_spec.experts, retained_experts)
             if model.__class__.__name__.lower() == "Ernie4_5_MoEForCausalLM".lower():
                 # transformers version >=4.54
                 # prune expert score correction bias too
@@ -197,7 +205,7 @@ def prune(
                 )
 
             # prune router
-            router = getattr(moe, model_attrs["router"])
+            router = getattr(moe, prune_spec.router)
             router.weight.data = router.weight.data[retained_expert_indicies, :]
             if getattr(router, "bias", None):
                 router.bias.data = router.bias.data[retained_expert_indicies]
@@ -206,12 +214,15 @@ def prune(
                 router.e_score_correction_bias.data = (
                     router.e_score_correction_bias.data[retained_expert_indicies]
                 )
-            setattr(moe, model_attrs["router"], router)
+            setattr(moe, prune_spec.router, router)
         else:
+            if model.__class__.__name__ != "Llama4ForCausalLM":
+                raise NotImplementedError(
+                    "Generic pruning for fused/special MoE is not implemented. "
+                    "Add a MODEL_ATTRS entry and custom pruning logic for this model."
+                )
             # prune fused experts, only tested for llama-4
-            moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
-                retained_expert_indicies
-            ]
+            moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[retained_expert_indicies]
             moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
             moe.num_experts = len(retained_expert_indicies)
             moe.router.weight.data = moe.router.weight.data[retained_expert_indicies]
@@ -222,7 +233,21 @@ def prune(
     # patch config and dump
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
-    setattr(model.config, model_attrs["num_experts"], retained_experts)
+    if model_attrs is not None:
+        setattr(model.config, model_attrs["num_experts"], retained_experts)
+    else:
+        # Best-effort: update common config fields so downstream loading has a chance.
+        updated = False
+        for cand in ("num_experts", "n_routed_experts", "num_local_experts", "moe_num_experts"):
+            if hasattr(model.config, cand):
+                setattr(model.config, cand, retained_experts)
+                updated = True
+        if not updated:
+            logger.warning(
+                "Could not find a known config field to update num_experts for %s; "
+                "you may need to patch the model config manually for correct loading.",
+                model.__class__.__name__,
+            )
     if model.__class__.__name__ == "Ernie4_5_MoeForCausalLM":  # remote-code verson
         model.config.moe_capacity = [
             retained_experts,
@@ -247,7 +272,8 @@ def prune_with_keep_plan(
     pruned_model_dir: pathlib.Path,
     keep_plan: dict[str, Any],
 ) -> pathlib.Path:
-    model_attrs = MODEL_ATTRS[model.__class__.__name__]
+    model_attrs = MODEL_ATTRS.get(model.__class__.__name__)
+    prune_spec = get_prune_moe_spec(model)
 
     # Map layer -> keep_k
     layer_to_keep: dict[int, int] = {}
@@ -310,18 +336,18 @@ def prune_with_keep_plan(
         retained_indices_by_layer[int(layer)] = retained
 
         moe = get_moe(model, layer)
-        if not model_attrs["fused"]:
-            all_experts = getattr(moe, model_attrs["experts"])
+        if not prune_spec.fused:
+            all_experts = getattr(moe, prune_spec.experts)
             retained_experts = [all_experts[i] for i in retained]
-            setattr(moe, model_attrs["experts"], torch.nn.ModuleList(retained_experts))
+            setattr(moe, prune_spec.experts, torch.nn.ModuleList(retained_experts))
 
             # prune router
-            router = getattr(moe, model_attrs["router"])
+            router = getattr(moe, prune_spec.router)
             router.weight.data = router.weight.data[retained, :]
             if getattr(router, "bias", None) is not None:
                 router.bias.data = router.bias.data[retained]
             router.out_features = len(retained)
-            setattr(moe, model_attrs["router"], router)
+            setattr(moe, prune_spec.router, router)
 
             # Best-effort: keep internal counters consistent if present
             if hasattr(moe, "num_experts"):

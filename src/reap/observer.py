@@ -29,7 +29,7 @@ class BaseTransformerObserverHookConfig:
     state_attr_name: str = "hook_state"
     hook_attr_name: str = "hooks"
     module_name_to_hook_regex: Optional[str] = None
-    module_class_name_to_hook_regex: Optional[nn.Module] = None
+    module_class_name_to_hook_regex: Optional[str] = None
 
 
 class BaseTransformerObserver(ABC):
@@ -103,38 +103,57 @@ class BaseTransformerObserver(ABC):
 
     def _validate_hook_config(self):
         if self.hook_config is None:
-            return
+            raise ValueError("hook_config must be provided.")
         if (
             self.hook_config.module_name_to_hook_regex is None
             and self.hook_config.module_class_name_to_hook_regex is None
         ):
             raise ValueError(
-                "At least one of 'module_n`ame_to_hook_regex' or "
-                "'module_type_to_hook_regex' must be provided in the hook config."
+                "At least one of 'module_name_to_hook_regex' or "
+                "'module_class_name_to_hook_regex' must be provided in the hook config."
             )
         if (
             self.hook_config.module_name_to_hook_regex is not None
             and self.hook_config.module_class_name_to_hook_regex is not None
         ):
             logger.warning(
-                "Both 'module_name_to_hook_regex' and 'module_type_to_hook_regex' are "
+                "Both 'module_name_to_hook_regex' and 'module_class_name_to_hook_regex' are "
                 "provided. Both conditions must be satisfied to hook the module."
             )
 
     def _hook_model(self):
+        self._validate_hook_config()
+
+        def _infer_layer_number(module_name: str) -> int | None:
+            # Prefer explicit "layers.<idx>" patterns.
+            m = re.search(r"(?:^|\\.)layers\\.(\\d+)(?:\\.|$)", module_name)
+            if m:
+                return int(m.group(1))
+            # Fall back to first integer (best-effort).
+            m = re.search(r"\\d+", module_name)
+            if m:
+                return int(m.group(0))
+            return None
+
         for name, module in self.model.named_modules():
-            hook_module = False
-            if (
-                self.hook_config.module_name_to_hook_regex
-                and re.search(self.hook_config.module_name_to_hook_regex, name)
-            ) or (
-                self.hook_config.module_class_name_to_hook_regex
-                and module.__class__.__name__
-                == self.hook_config.module_class_name_to_hook_regex
-            ):
-                hook_module = True
+            name_ok = True
+            cls_ok = True
+            if self.hook_config.module_name_to_hook_regex:
+                name_ok = re.search(self.hook_config.module_name_to_hook_regex, name) is not None
+            if self.hook_config.module_class_name_to_hook_regex:
+                cls_ok = re.search(
+                    self.hook_config.module_class_name_to_hook_regex,
+                    module.__class__.__name__,
+                ) is not None
+            hook_module = name_ok and cls_ok
             if hook_module:
-                layer_number = int(re.search(r"\d+", name).group(0))
+                layer_number = _infer_layer_number(name)
+                if layer_number is None:
+                    logger.warning(
+                        "Matched module '%s' but could not infer layer number; skipping hook.",
+                        name,
+                    )
+                    continue
                 hook_fn = self._hook_factory(module, layer_number)
                 hook = module.register_forward_hook(hook_fn)
                 self.hooks.append(hook)
@@ -222,10 +241,74 @@ class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
     distance_measure: str = "angular"
     renormalize_router_weights: bool = False
     record_pruning_metrics_only: bool = False
+    # Best-effort fallbacks for unknown model implementations.
+    num_experts_attr_candidates: tuple[str, ...] = (
+        "num_experts",
+        "num_local_experts",
+        "experts_per_rank",
+        "config.n_routed_experts",
+        "experts",
+    )
+    top_k_attr_candidates: tuple[str, ...] = (
+        "top_k",
+        "num_experts_per_tok",
+        "k",
+        "config.num_experts_per_tok",
+        "config.num_experts_per_tok",
+    )
 
 
 class MoETransformerObserver(BaseTransformerObserver):
     """MoE Transformer Observer for all methods including both pruning and merging."""
+
+    def _resolve_int_attr(self, module: nn.Module, primary: str, fallbacks: tuple[str, ...]) -> int | None:
+        def _resolve_path(obj: Any, path: str) -> Any | None:
+            cur = obj
+            for part in path.split("."):
+                if cur is None:
+                    return None
+                if not hasattr(cur, part):
+                    return None
+                cur = getattr(cur, part)
+            return cur
+
+        def _coerce_int(v: Any) -> int | None:
+            if v is None:
+                return None
+            if isinstance(v, bool):
+                return int(v)
+            if isinstance(v, int):
+                return int(v)
+            if torch.is_tensor(v) and v.numel() == 1:
+                return int(v.item())
+            if isinstance(v, nn.ModuleList):
+                return len(v)
+            if hasattr(v, "__len__") and not isinstance(v, (str, bytes, dict)):
+                try:
+                    return int(len(v))  # type: ignore[arg-type]
+                except Exception:
+                    return None
+            try:
+                return int(v)
+            except Exception:
+                return None
+
+        # Try primary then fallbacks on module
+        for p in (primary, *fallbacks):
+            v = _resolve_path(module, p)
+            out = _coerce_int(v)
+            if out is not None:
+                return out
+
+        # Fallback to model.config if available
+        cfg = getattr(self.model, "config", None)
+        if cfg is not None:
+            for p in (primary, *fallbacks):
+                v = _resolve_path(cfg, p.replace("config.", ""))
+                out = _coerce_int(v)
+                if out is not None:
+                    return out
+        return None
 
     def report_state(self) -> dict[str, Any]:
         """
@@ -326,10 +409,16 @@ class MoETransformerObserver(BaseTransformerObserver):
 
     def _hook_factory(self, module: nn.Module, layer_number: int) -> callable:
         distance_fn = get_distance_fn("cosine") # always use cosine for online dist. metrics
-        num_experts = reduce(
-            getattr, self.hook_config.num_experts_attr_name.split("."), module
+        num_experts = self._resolve_int_attr(
+            module,
+            self.hook_config.num_experts_attr_name,
+            getattr(self.hook_config, "num_experts_attr_candidates", tuple()),
         )
-        top_k = reduce(getattr, self.hook_config.top_k_attr_name.split("."), module)
+        top_k = self._resolve_int_attr(
+            module,
+            self.hook_config.top_k_attr_name,
+            getattr(self.hook_config, "top_k_attr_candidates", tuple()),
+        )
         if num_experts is None or top_k is None:
             raise ValueError(
                 f"Module {module.__class__.__name__} at layer {layer_number} "
@@ -689,3 +778,71 @@ OBSERVER_CONFIG_REGISTRY = {
     "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,
 }
+
+
+def infer_moe_observer_hook_config(
+    model: nn.Module,
+    *,
+    distance_measure: str = "cosine",
+    renormalize_router_weights: bool = False,
+    record_pruning_metrics_only: bool = False,
+) -> MoETransformerObserverConfig:
+    """
+    Best-effort MoE auto-detection to avoid manual registry edits.
+
+    This is intended for typical HF MoE blocks that expose an `experts` ModuleList and
+    a router (often named `gate`/`router`) and whose forward outputs include router logits.
+    If the discovered modules do not match the expected output signature, observation will
+    fail with a clear error at runtime.
+    """
+    moe_class_names: list[str] = []
+    fused_hint = False
+
+    for _name, mod in model.named_modules():
+        if not hasattr(mod, "experts"):
+            continue
+        experts = getattr(mod, "experts", None)
+        if experts is None:
+            continue
+        # Require there to be multiple experts (avoid false positives)
+        nE = None
+        if isinstance(experts, nn.ModuleList):
+            nE = len(experts)
+        elif hasattr(experts, "__len__"):
+            try:
+                nE = len(experts)
+            except Exception:
+                nE = None
+        if nE is None or nE < 2:
+            continue
+
+        if not isinstance(experts, nn.ModuleList):
+            fused_hint = True
+        moe_class_names.append(mod.__class__.__name__)
+
+    if not moe_class_names:
+        raise ValueError(
+            "Auto MoE detection failed: no modules with a multi-expert `experts` attribute were found. "
+            "You may still need to add a custom HookConfig in src/reap/observer.py."
+        )
+
+    # Build a class-name regex that matches all detected MoE block classes.
+    uniq = sorted(set(moe_class_names))
+    if len(uniq) == 1:
+        cls_pat = f"^{re.escape(uniq[0])}$"
+    else:
+        cls_pat = "^(" + "|".join(re.escape(x) for x in uniq) + ")$"
+
+    if fused_hint:
+        logger.warning(
+            "Auto MoE detection found non-ModuleList experts (fused/specialized MoE). "
+            "Some pruning modes may not be supported without custom adapters."
+        )
+
+    cfg = MoETransformerObserverConfig(
+        module_class_name_to_hook_regex=cls_pat,
+        distance_measure=distance_measure,
+        renormalize_router_weights=renormalize_router_weights,
+        record_pruning_metrics_only=record_pruning_metrics_only,
+    )
+    return cfg

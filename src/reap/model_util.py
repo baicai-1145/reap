@@ -1,5 +1,7 @@
 import torch
 import logging
+from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -129,9 +131,151 @@ MODEL_ATTRS = {
 }
 
 
+@dataclass(frozen=True)
+class PruneMoESpec:
+    moe_block: str
+    experts: str
+    router: str
+    fused: bool
+
+
+_AUTO_PRUNE_SPEC_CACHE: dict[str, PruneMoESpec] = {}
+
+
+def _infer_prune_spec_from_layer(layer_module: Any) -> PruneMoESpec:
+    # Find the MoE block within a decoder layer by scanning direct children first.
+    moe_block_name = None
+    moe_block = None
+    for child_name, child in layer_module.named_children():
+        if hasattr(child, "experts"):
+            experts = getattr(child, "experts", None)
+            if experts is None:
+                continue
+            try:
+                nE = len(experts)
+            except Exception:
+                nE = None
+            if nE is None or nE < 2:
+                continue
+            moe_block_name = child_name
+            moe_block = child
+            break
+    if moe_block is None or moe_block_name is None:
+        # Fall back to a shallow search (depth<=2) within the layer.
+        for full_name, mod in layer_module.named_modules():
+            if full_name == "":
+                continue
+            if hasattr(mod, "experts"):
+                experts = getattr(mod, "experts", None)
+                if experts is None:
+                    continue
+                try:
+                    nE = len(experts)
+                except Exception:
+                    nE = None
+                if nE is None or nE < 2:
+                    continue
+                # Only accept a 1-hop attribute path for now (keeps pruning logic simple).
+                if "." in full_name:
+                    continue
+                moe_block_name = full_name
+                moe_block = mod
+                break
+    if moe_block is None or moe_block_name is None:
+        raise ValueError(
+            "Unable to infer MoE block within decoder layer (no module with multi-expert `experts` found)."
+        )
+
+    # Experts attribute name (prefer `.experts`)
+    experts_attr = None
+    experts_obj = getattr(moe_block, "experts", None)
+    if isinstance(experts_obj, torch.nn.ModuleList) and len(experts_obj) >= 2:
+        experts_attr = "experts"
+        num_experts = len(experts_obj)
+        fused = False
+    else:
+        # Try to find a ModuleList child that looks like experts
+        candidates = []
+        for child_name, child in moe_block.named_children():
+            if isinstance(child, torch.nn.ModuleList) and len(child) >= 2:
+                candidates.append((child_name, child))
+        if candidates:
+            experts_attr, experts_obj = candidates[0]
+            num_experts = len(experts_obj)
+            fused = False
+        else:
+            # Fused/special MoE (not supported by generic pruning)
+            fused = True
+            experts_attr = "experts" if hasattr(moe_block, "experts") else "<unknown>"
+            num_experts = None
+
+    # Router attribute name (prefer `.gate`/`.router`)
+    router_attr = None
+    for cand in ("gate", "router"):
+        r = getattr(moe_block, cand, None)
+        if isinstance(r, torch.nn.Linear):
+            router_attr = cand
+            break
+    if router_attr is None and not fused and num_experts is not None:
+        # Best-effort: find a Linear child whose out_features equals num_experts
+        for child_name, child in moe_block.named_children():
+            if isinstance(child, torch.nn.Linear) and getattr(child, "out_features", None) == num_experts:
+                router_attr = child_name
+                break
+    if router_attr is None:
+        router_attr = "gate" if hasattr(moe_block, "gate") else "router" if hasattr(moe_block, "router") else "<unknown>"
+
+    return PruneMoESpec(
+        moe_block=str(moe_block_name),
+        experts=str(experts_attr),
+        router=str(router_attr),
+        fused=bool(fused),
+    )
+
+
+def get_prune_moe_spec(model) -> PruneMoESpec:
+    """
+    Return a minimal MoE spec required for pruning (moe_block/experts/router/fused).
+    Falls back to best-effort inference for unknown models.
+    """
+    model_cls = model.__class__.__name__
+    cached = _AUTO_PRUNE_SPEC_CACHE.get(model_cls)
+    if cached is not None:
+        return cached
+
+    attrs = MODEL_ATTRS.get(model_cls)
+    if attrs is not None:
+        spec = PruneMoESpec(
+            moe_block=attrs["moe_block"],
+            experts=attrs["experts"],
+            router=attrs["router"],
+            fused=bool(attrs.get("fused", False)),
+        )
+        _AUTO_PRUNE_SPEC_CACHE[model_cls] = spec
+        return spec
+
+    # Infer from first layer as a representative template.
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError(
+            f"Auto MoE pruning spec inference failed for {model_cls}: expected model.model.layers."
+        )
+    layer0 = model.model.layers[0]
+    spec = _infer_prune_spec_from_layer(layer0)
+    _AUTO_PRUNE_SPEC_CACHE[model_cls] = spec
+    logger.warning(
+        "Inferred MoE pruning spec for unknown model %s: moe_block=%s experts=%s router=%s fused=%s",
+        model_cls,
+        spec.moe_block,
+        spec.experts,
+        spec.router,
+        spec.fused,
+    )
+    return spec
+
+
 def get_moe(model, layer):
-    moe_attr_name = MODEL_ATTRS.get(model.__class__.__name__)["moe_block"]
-    return getattr(model.model.layers[layer], moe_attr_name)
+    spec = get_prune_moe_spec(model)
+    return getattr(model.model.layers[layer], spec.moe_block)
 
 
 def assert_merge(model, merged_moe, cluster_label):

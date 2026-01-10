@@ -216,20 +216,31 @@ def record_activations(
     )
 
     # load observer and hook model
+    renormalize_router_weights = (
+        getattr(model.config, "norm_topk_prob", False) and obs_args.renormalize_router_weights
+    )
+    if renormalize_router_weights:
+        logger.info("Renormalizing topk router weights to sum to 1.")
     try:
-        renormalize_router_weights = getattr(model.config, "norm_topk_prob", False) and obs_args.renormalize_router_weights
-        if renormalize_router_weights:
-            logger.info("Renormalizing topk router weights to sum to 1.")
         observer_config = OBSERVER_CONFIG_REGISTRY[model.__class__.__name__](
             # distance_measure=obs_args.distance_measure,
-            distance_measure='cosine',
+            distance_measure="cosine",
             renormalize_router_weights=renormalize_router_weights,
             record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
         )
     except KeyError:
-        raise ValueError(
-            f"No observer configuration registered for model '{model.__class__.__name__}'. "
-            f"Supported: {list(OBSERVER_CONFIG_REGISTRY.keys())}"
+        from reap.observer import infer_moe_observer_hook_config
+
+        logger.warning(
+            "No observer configuration registered for model '%s'. "
+            "Attempting best-effort MoE auto-detection.",
+            model.__class__.__name__,
+        )
+        observer_config = infer_moe_observer_hook_config(
+            model,
+            distance_measure="cosine",
+            renormalize_router_weights=renormalize_router_weights,
+            record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
         )
     observer = MoETransformerObserver(
         model=model,
